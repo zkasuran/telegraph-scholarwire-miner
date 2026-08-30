@@ -1,0 +1,38 @@
+This miner serves data from third parties. Their terms travel with it.
+
+Each block below names one upstream, what it provides, the licence it publishes under, and the
+exact credit line that licence requires. Every credit line marked required also travels in the
+`attribution` field of every answer this miner returns, not only in this file.
+
+## api.openalex.org
+
+Scholarly works, citation counts and venues.
+
+Licence: CC0 1.0 for the data.
+
+Required credit line:
+
+    Scholarly metadata from OpenAlex, CC0 1.0.
+
+## api.crossref.org
+
+Scholarly works metadata.
+
+Licence: No single SPDX id. The public pool is open.
+
+In the provider's own words: "No sign-up is required to use the REST API, and almost none of the metadata is subject to copyright" and "you may use it for any purpose."
+
+Required credit line:
+
+    Scholarly metadata from Crossref.
+
+## en.wikipedia.org
+
+Encyclopedic answer text for a research question.
+
+Licence: CC BY-SA 4.0
+
+Required credit line:
+
+    Text from English Wikipedia, CC BY-SA 4.0, adapted (trimmed to the sentences that answer the question).
+

@@ -1,0 +1,114 @@
+version: "1"
+kind: miner
+id: 7326
+slug: scholarwire-research-query
+protocol: generic
+name: ScholarWire Research Query
+description: >
+  A factual answer to a research question, read live from the Wikipedia REST summary API at
+  request time. Answers the RESEARCH_QUERY intent: the question is mapped to a Wikipedia page
+  then answered in one or two plain sentences, followed by a Readings block with the page title,
+  the canonical URL and the source. OpenAlex is a scholarly backup when no page fits. No API
+  key, nothing cached that can go stale.
+base_url: https://telegraph-scholar.margyn.workers.dev
+
+docs:
+  documentation: https://telegraph-scholar.margyn.workers.dev/
+
+limitations:
+  - code: MAX_PARAM_VALUE
+    message: question is a research question or a subject, for example "who discovered penicillin" or "Photosynthesis". A whole question is accepted too.
+    param: question
+    property: length
+    value_num: 300
+    operator: lte
+
+rate_limit_per_sec: 2
+cache_ttl_sec: 10
+circuit_threshold: 5
+circuit_cooldown_seconds: 30
+
+input_schema:
+  type: object
+  properties:
+    question:
+      type: string
+      description: >
+        The full natural-language question, verbatim, for example "who discovered penicillin?".
+        The miner maps it to the best Wikipedia page and answers from that page's summary.
+    topic:
+      type: string
+      description: A subject to look up directly, for example "Photosynthesis" or "Black hole".
+
+output_schema:
+  type: object
+  properties:
+    question:
+      type: string
+      description: The question the answer is for.
+    topic:
+      type: string
+      description: The subject parsed from the question.
+    title:
+      type: string
+      description: Title of the Wikipedia page the answer came from.
+    answer:
+      type: string
+      description: The direct answer, one or two sentences from the page summary.
+    page_url:
+      type: string
+      description: Canonical URL of the source page.
+    confidence:
+      type: number
+      description: 0.95 for a Wikipedia read, 0.9 for the OpenAlex backup.
+    summary:
+      type: string
+      description: The direct answer, then a Readings block with the page title, URL and source.
+    as_of:
+      type: string
+      description: ISO 8601 timestamp of the read.
+
+endpoints:
+  - path: /research
+    external_path: /research
+    method: GET
+    description: >
+      Answer for one question, question as a query parameter
+      (?question=who%20discovered%20penicillin). A bare subject works in ?topic= or ?query=.
+
+semantics:
+  signal_mapping:
+    confidence_field: confidence
+    label_field: summary
+    reason_field: summary
+  supported_intents:
+    - RESEARCH_QUERY
+
+on_chain:
+  transform: direct
+  min_price_usdc: 0.01
+  fields:
+    strings:
+      - index: 0
+        name: topic
+        description: The subject parsed from the question.
+        source_path: topic
+      - index: 1
+        name: title
+        description: Title of the Wikipedia page the answer came from.
+        source_path: title
+      - index: 2
+        name: summary
+        description: The direct answer, then a Readings block with the page title, URL and source.
+        source_path: summary
+    integers:
+      - index: 0
+        name: confidence_x100
+        description: Confidence in the answer, scaled by one hundred to keep two decimals as an integer.
+        source_path: confidence
+        multiplier: 100
+  request:
+    - endpoint: research
+      method: GET
+      query_params:
+        question: { source: strings.0 }

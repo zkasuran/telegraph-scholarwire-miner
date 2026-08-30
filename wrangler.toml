@@ -1,0 +1,7 @@
+name = "telegraph-scholar"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+# ScholarWire research miner for Telegraph. Serves ACADEMIC_SEARCH (/papers), RESEARCH_QUERY
+# (/research) and RESEARCH_SYNTHESIS (/synthesis) from OpenAlex, Crossref and the Wikipedia REST
+# API, all keyless. No secrets, no bindings: deploy is a bare `wrangler deploy`.

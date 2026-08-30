@@ -1,0 +1,112 @@
+version: "1"
+kind: miner
+id: 7327
+slug: scholarwire-research-synthesis
+protocol: generic
+name: ScholarWire Research Synthesis
+description: >
+  A short synthesis of what is known on a topic, drawn live from more than one source: the
+  Wikipedia REST summary for the definition and the top OpenAlex works for the evidence base.
+  Answers the RESEARCH_SYNTHESIS intent: a synthesis paragraph then a Readings block citing the
+  Wikipedia page and each paper with its year, citation count and DOI. Pass a topic or a whole
+  question. No API key, nothing cached that can go stale.
+base_url: https://telegraph-scholar.margyn.workers.dev
+
+docs:
+  documentation: https://telegraph-scholar.margyn.workers.dev/
+
+limitations:
+  - code: MAX_PARAM_VALUE
+    message: topic is a subject or a whole question, for example "mRNA vaccines" or "how do vaccines work". A whole question is accepted too.
+    param: topic
+    property: length
+    value_num: 200
+    operator: lte
+
+rate_limit_per_sec: 2
+cache_ttl_sec: 10
+circuit_threshold: 5
+circuit_cooldown_seconds: 30
+
+input_schema:
+  type: object
+  properties:
+    question:
+      type: string
+      description: >
+        The full natural-language request, verbatim, for example "what is known about mRNA
+        vaccines". The miner reads the subject from it, so passing the whole question works as
+        well as naming the topic.
+    topic:
+      type: string
+      description: Subject to synthesize, for example "mRNA vaccines" or "climate change".
+
+output_schema:
+  type: object
+  properties:
+    topic:
+      type: string
+      description: The subject the synthesis is for.
+    sources_used:
+      type: integer
+      description: Number of sources combined, the Wikipedia page plus each paper.
+    wikipedia:
+      type: object
+      description: Title and URL of the Wikipedia page used.
+    works:
+      type: array
+      description: The papers cited, each with title, year, citations and DOI.
+    confidence:
+      type: number
+      description: 0.95 for a direct read across the sources.
+    summary:
+      type: string
+      description: A synthesis paragraph, then a Readings block citing every source.
+    as_of:
+      type: string
+      description: ISO 8601 timestamp of the read.
+
+endpoints:
+  - path: /synthesis
+    external_path: /synthesis
+    method: GET
+    description: >
+      Synthesis for one topic, topic as a query parameter (?topic=mRNA%20vaccines). Also accepts
+      a whole question in ?question= or ?query=.
+
+semantics:
+  signal_mapping:
+    confidence_field: confidence
+    label_field: summary
+    reason_field: summary
+  supported_intents:
+    - RESEARCH_SYNTHESIS
+
+on_chain:
+  transform: direct
+  min_price_usdc: 0.01
+  fields:
+    strings:
+      - index: 0
+        name: topic
+        description: The subject the synthesis is for.
+        source_path: topic
+      - index: 1
+        name: summary
+        description: A synthesis paragraph, then a Readings block citing every source.
+        source_path: summary
+      - index: 2
+        name: question
+        description: The request the synthesis answers.
+        source_path: question
+    integers:
+      - index: 0
+        name: sources_used
+        description: Number of sources combined into the synthesis.
+        source_path: sources_used
+        multiplier: 1
+  request:
+    - endpoint: synthesis
+      method: GET
+      query_params:
+        topic: { source: strings.0 }
