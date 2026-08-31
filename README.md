@@ -7,9 +7,10 @@ silently go stale.
 - **ACADEMIC_SEARCH**: scholarly papers on a topic, from the OpenAlex works API with Crossref as
   a fallback. Names the top match in one sentence then lists the top three with authors, year,
   venue, citation count and DOI.
-- **RESEARCH_QUERY**: a factual answer to a research question, from the Wikipedia REST summary
-  API. The question is mapped to a page then answered in one or two plain sentences, with the
-  page title, the canonical URL and the source behind it. OpenAlex is a scholarly backup.
+- **RESEARCH_QUERY**: a factual answer to a research question. A question that asks what the
+  evidence shows ("does X compared to Y affect Z") is answered from the conclusion of a paper's
+  own abstract, via Europe PMC and restricted to CC BY articles. Anything else is answered from
+  the Wikipedia REST summary API, with the page title, the canonical URL and the source behind it.
 - **RESEARCH_SYNTHESIS**: a short synthesis of a topic from more than one source. The Wikipedia
   definition leads, the most-cited OpenAlex works ground it, then every source is cited.
 
@@ -71,11 +72,46 @@ Built on the lessons the sibling SkyWire and ChainWire miners learned against th
 - **OpenAlex** works API, `https://api.openalex.org/works`. Title, year, citation count,
   authors, venue and DOI. No key.
 - **Crossref** works API, `https://api.crossref.org/works`, the fallback for paper search.
+- **Europe PMC** search, `https://www.ebi.ac.uk/europepmc/webservices/rest/search`, restricted to
+  CC BY articles. This is the only source a finding is quoted from. The reason is licensing rather
+  than coverage: Crossref's own metadata grant carves abstracts out ("Some abstracts
+  contained in the metadata may be subject to copyright by publishers or authors"), so an abstract
+  is the author's text unless the article says otherwise. Europe PMC publishes each article's
+  licence and lets a query filter on it, so the search asks for `LICENSE:"cc by"` and the answer
+  names the licence it relied on.
 - **Wikipedia REST** summary and search, `https://en.wikipedia.org/api/rest_v1/` and
   `https://en.wikipedia.org/w/rest.php/v1/search/`. The page summary, plus title and fulltext
   search to map a question to a page.
 
 None of these need an API key. There are no secrets in the worker or in `wrangler.toml`.
+
+OpenAlex is tried first for paper search and Crossref carries most of it in practice. OpenAlex
+meters by daily budget rather than request rate, an unauthenticated caller gets $0.10 of usage per
+day and a search costs $1 per 1,000 calls, so a Cloudflare Worker sharing its egress addresses
+with the rest of the edge answers 429 most of the time. Crossref asks only for a contact in the
+User-Agent and publishes its limit in the response headers.
+
+## Answering a research question
+
+A question that asks what the evidence shows is a different question from what a term means, and
+the two need different sources. "Does intermittent fasting improve insulin sensitivity" is
+answered by the literature. "What is photosynthesis" is answered by an encyclopedia.
+
+So a research-shaped question goes to Europe PMC, where only the labelled conclusion of an
+abstract is quoted. That last part is a rule rather than a preference: a structured abstract labels its own
+sections, so the label is the author's marker for "this is what we found". An abstract with no
+such label is skipped rather than guessed at, because the closing sentences of an unlabelled
+abstract are as likely to be a blurb ("The chapter briefly reviews other relevant studies") as a
+finding. Quoting that as an answer would state something the paper did not conclude.
+
+Three query plans run narrowest first, because a bare AND of the question's words returns the most
+cited paper in the field rather than the one that answers the question: asked for vitamin D and
+respiratory infections, it returned the PRISMA reporting statement.
+
+The answer states the direction of the finding, read from the conclusion's own words rather than
+inferred. A conclusion that negates the outcome the question named gets "on that evidence the
+answer is no", one asserting an improvement gets a yes, a mixed or descriptive conclusion gets no
+verdict at all.
 
 ## Endpoints
 

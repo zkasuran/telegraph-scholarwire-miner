@@ -4,6 +4,18 @@ Each block below names one upstream, what it provides, the licence it publishes 
 exact credit line that licence requires. Every credit line marked required also travels in the
 `attribution` field of every answer this miner returns, not only in this file.
 
+## www.ebi.ac.uk/europepmc
+
+The finding that answers a research question, quoted from an open-access article's abstract.
+
+Licence: Per article, and the query asks only for CC BY 4.0 records.
+
+In the provider's own words: EMBL-EBI "places no additional restrictions on the use or redistribution of the data available via its Data Resources and Tools other than those provided by the original data owners"; Europe PMC records that "The respective copyright holders retain rights for reproduction, redistribution and reuse" and exposes each article's own licence, which is what the LICENSE:"cc by" filter selects on.
+
+Required credit line:
+
+    Finding quoted from an open-access article via Europe PMC, CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/), quoted from the abstract with the article named.
+
 ## api.openalex.org
 
 Scholarly works, citation counts and venues.

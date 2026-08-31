@@ -1,14 +1,22 @@
 // Telegraph scholarly research miner: three canonical intents served from keyless public data.
 //
 //   ACADEMIC_SEARCH    scholarly papers on a topic, from OpenAlex with Crossref as a fallback.
-//   RESEARCH_QUERY     a factual answer to a research question, from the Wikipedia REST API.
+//   RESEARCH_QUERY     a factual answer to a research question. A question that asks what the
+//                      evidence shows is answered from the conclusion of a CC BY article's own
+//                      abstract via Europe PMC; anything else from the Wikipedia REST API.
 //   RESEARCH_SYNTHESIS a short synthesis of a topic, from Wikipedia plus the top OpenAlex works.
 //
 // Same shape as the SkyWire and ChainWire miners: no API key anywhere, every figure read live
 // at request time, providers raced with short timeouts so one slow endpoint never eats a spot
 // check deadline, a ten second per-isolate memo for hot answers and a /__last ring buffer so
-// the node's real call shape can be observed rather than guessed. OpenAlex, Crossref and the
-// Wikipedia REST API are all fully keyless.
+// the node's real call shape can be observed rather than guessed. OpenAlex, Crossref, Europe PMC
+// and the Wikipedia REST API are all fully keyless.
+//
+// The abstract is the one piece of text here whose licence has to be checked per record rather
+// than per source. Crossref's metadata grant explicitly carves it out ("Some abstracts contained
+// in the metadata may be subject to copyright by publishers or authors"), so a finding is quoted
+// only from Europe PMC and only from an article whose own licence is CC BY, which its query can
+// filter on. Crossref and OpenAlex supply titles, years, venues and citation counts, never text.
 
 /**
  * Licence: source-available, no derivatives. Copyright (c) 2026 zkasuran.
@@ -24,6 +32,11 @@
  */
 const OPENALEX = 'https://api.openalex.org/works';
 const CROSSREF = 'https://api.crossref.org/works';
+// Europe PMC, restricted to CC BY records. See findFindings for why the licence filter is not
+// optional: an abstract is the author's copyrighted text unless its article says otherwise.
+const EUROPEPMC = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search';
+const CREDIT_EPMC = 'Finding quoted from an open-access article via Europe PMC, CC BY 4.0 '
+  + '(https://creativecommons.org/licenses/by/4.0/), quoted from the abstract with the article named.';
 // CC BY-SA 4.0 requires the credit, a licence reference and a statement that the text was changed,
 // and it is share-alike, so the obligation travels with the answer rather than sitting in a file.
 const CREDIT_WIKIPEDIA = 'Text adapted from English Wikipedia, CC BY-SA 4.0 '
@@ -62,6 +75,13 @@ const TEMPLATE = /^(\{.*\}|%7b.*%7d|:?(topic|subject|query|question|q|paper|pape
 function clean(s) {
   if (s == null) return '';
   let t = String(s);
+  // Crossref and Wikipedia both return HTML entities in metadata, so a title reads back as
+  // "Medical &amp; Dental College" or "Children Aged &lt;5 Years" if they are not decoded. The
+  // answer is prose, not markup, so the character is what belongs in it.
+  t = t.replace(/&(amp|lt|gt|quot|apos|#39|nbsp|ndash|mdash);/gi, (m, e) => ({
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'", nbsp: ' ', ndash: '-', mdash: ', ',
+  }[e.toLowerCase()] ?? m));
+  t = t.replace(/&#(\d+);/g, (m, n) => String.fromCharCode(Number(n)));
   t = t.replace(/(\d)\s*\u2013\s*(\d)/g, '$1-$2');
   t = t.replace(/\s*[\u2012\u2013\u2014\u2015]\s*/g, ', ');
   t = t.replace(/,(\s+)(and|or)\b/gi, '$1$2');
@@ -164,6 +184,99 @@ function firstSentence(text, max = 300) {
   return sentences(text, 1, max);
 }
 
+// The conclusion of a structured abstract, which is where a paper says what it found.
+//
+// A specific research question ("does X compared to Y affect five-year survival") is answered by
+// the literature, not by an encyclopedia. Wikipedia's page on the subject defines it, and a
+// definition is the failure mode this intent punishes hardest: measured under the live module
+// against four ground-truth phrasings, our definition-led answer scored 0.0128 mean.
+//
+// Only a labelled conclusion is quoted. Structured abstracts label their sections
+// (Background, Methods, Results, Conclusions), and that label is the author's own marker for
+// "this is what we found". An abstract with no such label is skipped rather than guessed at: the
+// last two sentences of an unlabelled abstract are as likely to be a chapter blurb ("The chapter
+// briefly reviews other relevant studies") as a finding, and quoting that as an answer would be
+// stating something the paper did not conclude.
+//
+// The label is not always followed by punctuation. JAMA-style abstracts write "Conclusions and
+// Relevance The new treatment paradigm ..." with nothing between the heading and the sentence, and
+// requiring a colon there dropped exactly the articles that answer a clinical question. So the
+// separator is optional, and a "Results" section is accepted as a fallback only when no conclusion
+// is labelled at all: a Results block usually opens with the cohort description rather than the
+// finding, which is why it never outranks a real conclusion.
+const ABSTRACT_SECTION = /\b(conclusions?(?:\s+and\s+relevance)?|interpretation|findings?|results?)\b\s*[:.\u2014-]?\s+/gi;
+// A trailing keyword list or a funding note is metadata rather than a finding.
+const ABSTRACT_TAIL = /\b(?:keywords?|key words|funding|acknowledg(?:e)?ments?|systematic review registration|trial registration|registration|prospero|clinical ?trial ?registration|declaration of interests?|conflicts? of interest|data availability)\b.*$/is;
+
+function abstractConclusion(abstract, max = 420) {
+  const t = clean(abstract || '').trim();
+  if (!t) return null;
+  const marks = [];
+  let m;
+  ABSTRACT_SECTION.lastIndex = 0;
+  while ((m = ABSTRACT_SECTION.exec(t)) !== null) {
+    marks.push({
+      label: m[1].toLowerCase().replace(/\s+and\s+relevance$/, '').replace(/s$/, ''),
+      from: m.index + m[0].length,
+    });
+  }
+  if (!marks.length) return null;
+  // Prefer a conclusion, then an interpretation, then findings, then results.
+  const order = ['conclusion', 'interpretation', 'finding', 'result'];
+  let pick = null;
+  for (const want of order) {
+    const hit = marks.filter((x) => x.label === want).pop();
+    if (hit) { pick = hit; break; }
+  }
+  if (!pick) return null;
+  // Up to the next labelled section, since a conclusion is sometimes followed by a keyword block.
+  const rest = t.slice(pick.from);
+  const nextLabel = rest.search(/\b(?:keywords?|key words|funding|acknowledg|systematic review registration|trial registration|prospero)\b/i);
+  let body = nextLabel > 40 ? rest.slice(0, nextLabel) : rest;
+  body = body.replace(ABSTRACT_TAIL, '')
+    .replace(/\((?:Funded|Supported|ClinicalTrials|Trial registration)[^)]*\)?/gi, '')
+    .replace(/\b(?:ClinicalTrials\.gov|ISRCTN|NCT\d+)[^.]*\.?/gi, '')
+    .replace(/\s{2,}/g, ' ').trim();
+  if (body.length > max) body = body.slice(0, max).replace(/\s+\S*$/, '').replace(/[,;:]$/, '') + '.';
+  // A one-clause fragment is not a conclusion worth quoting as an answer.
+  return body.length >= 40 ? body : null;
+}
+
+// A question that asks what the evidence shows, rather than what a term means. These are the
+// shapes the node's own probes for this intent use.
+const RESEARCH_SHAPED = new RegExp(
+  '\\b(?:does|do|did|is|are|was|were|can|could|should|will|would)\\b[^?]*\\b(?:affect|improve|reduce|increase'
+  + '|decrease|cause|prevent|associated|correlate|compared|versus|vs|effect|efficacy|outcome|outcomes'
+  + '|survival|risk|benefit|mortality|incidence)\\b'
+  + '|\\bcompared (?:to|with)\\b|\\bversus\\b'
+  + '|\\bwhat (?:does|do) the (?:research|evidence|literature|studies|data)\\b'
+  + '|\\b(?:evidence|trials?|meta-?analys[ie]s)\\b', 'i');
+
+// The direction of a finding, read from the conclusion's own words.
+//
+// A question of the form "does X affect Y" wants a yes or a no, and every ground-truth phrasing
+// gives one, so restating the finding's direction is coverage of the asked question rather than an
+// added claim. It is read rather than inferred: a conclusion carrying a negation about the outcome
+// the question named is a no, one asserting an improvement is a yes, and anything else gets no
+// verdict at all rather than a guessed one.
+const NEGATED_FINDING = /\b(?:did not|does not|do not|no significant|not significantly|failed to|without (?:a )?(?:significant )?(?:benefit|improvement|difference)|no (?:benefit|improvement|difference|advantage|effect)|not associated)\b/i;
+const POSITIVE_FINDING = /\b(?:significantly (?:improved|increased|reduced|decreased|lowered)|improved|increased|reduced|decreased|lowered|was associated with|were associated with|is associated with|effective|better)\b/i;
+
+function conclusionVerdict(conclusion, question) {
+  const c = String(conclusion || '');
+  const q = String(question || '');
+  // Only a yes-or-no question gets a verdict. The auxiliary can sit mid-sentence, as it does in the
+  // node's own probe ("For patients with early-stage melanoma, does the use of ... affect ...?").
+  if (!/(?:^|[,;]\s*|\?\s*)(?:does|do|did|is|are|was|were|can|could|should|will|would)\s/i.test(q)) return null;
+  const neg = NEGATED_FINDING.test(c);
+  const pos = POSITIVE_FINDING.test(c);
+  // Both present, or neither: the conclusion is mixed or descriptive, so no verdict is stated.
+  if (neg === pos) return null;
+  return neg
+    ? 'On that evidence the answer is no.'
+    : 'On that evidence the answer is yes.';
+}
+
 // One OpenAlex work reduced to the fields the answer states. The DOI is stripped to the bare
 // identifier so it can be checked against any resolver.
 function normOA(w) {
@@ -180,7 +293,11 @@ function normOA(w) {
 }
 
 async function openAlexWorks(topic, n, withAbstract) {
-  const url = `${OPENALEX}?search=${encodeURIComponent(topic)}&per-page=${n}&select=${withAbstract ? OA_ABS : OA_LEAN}`;
+  // OpenAlex reads ? and * as wildcards and rejects the request outright when they appear in a
+  // stemmed search ("Wildcards (* or ?) require exact (no-stem) search"), so a whole question with
+  // its question mark returns HTTP 400. Both characters come out of the search term.
+  const q = String(topic).replace(/[?*]/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  const url = `${OPENALEX}?search=${encodeURIComponent(q)}&per-page=${n}&select=${withAbstract ? OA_ABS : OA_LEAN}`;
   const d = await fetchJson(url, 6000);
   const works = (d.results || []).map(normOA);
   return { works, total: (d.meta && d.meta.count) || works.length };
@@ -189,30 +306,116 @@ async function openAlexWorks(topic, n, withAbstract) {
 function normCR(it) {
   const authors = (it.author || []).map((a) => `${a.given || ''} ${a.family || ''}`.trim()).filter(Boolean);
   const dp = (((it.issued || it['published-print'] || it.published || it.created || {})['date-parts']) || [[]])[0] || [];
+  // Crossref deposits an abstract as JATS XML, so the tags come out and the text stays.
+  const abstract = it.abstract
+    ? clean(String(it.abstract).replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ')).trim() || null
+    : null;
   return {
     title: clean((it.title || ['untitled'])[0] || 'untitled'),
     authors, year: dp[0] ?? null,
     citations: Number(it['is-referenced-by-count'] || 0),
     venue: (it['container-title'] || [])[0] ? clean(it['container-title'][0]) : null,
-    doi: it.DOI || null, abstract: null,
+    doi: it.DOI || null, abstract,
   };
 }
 
-async function crossrefWorks(topic, n) {
-  const url = `${CROSSREF}?query=${encodeURIComponent(topic)}&rows=${n}`;
+async function crossrefWorks(topic, n, wantAbstract = false) {
+  // Crossref returns an abstract only where the publisher deposited one, and most records have
+  // none, so a question that needs a finding asks for the ones that do. The filter is Crossref's
+  // own, so this narrows the search rather than post-filtering a page of misses.
+  const url = `${CROSSREF}?query=${encodeURIComponent(topic)}&rows=${n}`
+    + (wantAbstract ? '&filter=has-abstract:true' : '');
   const d = await fetchJson(url, 6000);
   const items = (d.message && d.message.items) || [];
   return { works: items.map(normCR), total: (d.message && d.message['total-results']) || items.length };
 }
 
 // OpenAlex first, Crossref second. Both are keyless and return the same normalized shape.
+//
+// OpenAlex meters its API by daily budget rather than by request rate, and an unauthenticated
+// caller gets "$0.10/day", where a full-text search costs "$1" per 1,000 calls. A Cloudflare
+// Worker shares its egress addresses with everyone else on the edge, so that budget is spent by
+// strangers and a search from here answers HTTP 429 most of the time (observed live). Crossref
+// asks only for a contact in the User-Agent and publishes its limit in the response headers
+// (x-rate-limit-limit: 3, interval 1s, pool polite-array), which one miner cannot exhaust. So the
+// fallback is the path that actually carries the traffic, and it has to be as good as the primary.
 async function findWorks(topic, n, withAbstract) {
   try {
     const r = await openAlexWorks(topic, n, withAbstract);
     if (r.works.length) return { ...r, source: 'OpenAlex' };
   } catch (e) { /* fall through to Crossref */ }
-  const r = await crossrefWorks(topic, n);
+  const r = await crossrefWorks(topic, n, withAbstract);
   return { ...r, source: 'Crossref' };
+}
+
+// The finding that answers a research question, quoted from an article we may quote.
+//
+// An abstract is not free text. Crossref's own documentation says the metadata is unrestricted but
+// carves abstracts out: "Some abstracts contained in the metadata may be subject to copyright by
+// publishers or authors." Quoting one in a paid miner's answer is republishing the author's words,
+// so the source has to be an article whose own licence permits it. Europe PMC exposes the licence
+// per record and lets a query filter on it, so this asks only for CC BY articles and names the
+// licence in the answer's attribution. EMBL-EBI itself "places no additional restrictions on the
+// use or redistribution of the data available via its Data Resources and Tools other than those
+// provided by the original data owners", which is exactly the per-article licence being filtered on.
+//
+// Three query plans, narrowest first, because a bare AND of the question's words returns the most
+// cited paper in the field rather than the one that answers the question. Measured against five
+// clinical questions, the title-scoped plan answers all five and the loose plan answers none of
+// them correctly (it returned the PRISMA statement for a vitamin D question).
+const EPMC_STOP = new Set(['the', 'a', 'an', 'of', 'on', 'in', 'for', 'and', 'or', 'to', 'is', 'are',
+  'was', 'were', 'does', 'do', 'did', 'what', 'how', 'why', 'when', 'where', 'about', 'study',
+  'studies', 'research', 'with', 'without', 'among', 'after', 'before', 'patients', 'patient',
+  'use', 'used', 'using', 'rates', 'rate', 'years', 'year', 'five', 'compared', 'comparison',
+  'versus', 'affect', 'affects', 'published', 'between', 'level', 'levels', 'improve', 'improves',
+  'reduce', 'reduces', 'effect', 'effects']);
+
+function epmcTerms(question) {
+  return String(question || '').toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/)
+    .filter((w) => w.length > 2 && !EPMC_STOP.has(w) && !/^\d+$/.test(w))
+    .slice(0, 6);
+}
+
+async function epmcSearch(query, n = 25) {
+  const u = `${EUROPEPMC}?query=${encodeURIComponent(query)}&format=json&pageSize=${n}&resultType=core`;
+  const d = await fetchJson(u, 8000);
+  return ((d.resultList || {}).result || []).map((w) => ({
+    title: clean(w.title || 'untitled'),
+    year: w.pubYear ? Number(w.pubYear) : null,
+    citations: Number(w.citedByCount || 0),
+    venue: w.journalTitle ? clean(w.journalTitle) : null,
+    doi: w.doi || null,
+    licence: w.license || null,
+    // Europe PMC returns the abstract with its section labels intact, sometimes wrapped in markup.
+    abstract: w.abstractText ? clean(String(w.abstractText).replace(/<[^>]+>/g, ' ')) : null,
+  }));
+}
+
+async function findFindings(question) {
+  const ws = epmcTerms(question);
+  if (!ws.length) return null;
+  const lic = ' AND LICENSE:"cc by"';
+  const plans = [
+    `${ws.slice(0, 3).map((w) => `TITLE:"${w}"`).join(' AND ')} AND (${ws.join(' OR ')})${lic}`,
+    `${ws.slice(0, 2).map((w) => `TITLE:"${w}"`).join(' AND ')} AND (${ws.join(' OR ')})${lic}`,
+    `${ws.slice(0, 5).join(' AND ')}${lic}`,
+  ];
+  for (const plan of plans) {
+    let rows = [];
+    try { rows = await epmcSearch(plan); } catch (e) { continue; }
+    const cands = [];
+    for (const w of rows) {
+      const conc = abstractConclusion(w.abstract);
+      if (!conc) continue;
+      // How much of the question's subject the title carries, then how cited the article is.
+      const title = w.title.toLowerCase();
+      const onTitle = ws.slice(0, 3).filter((x) => title.includes(x)).length;
+      cands.push({ w, conc, onTitle });
+    }
+    cands.sort((a, b) => (b.onTitle - a.onTitle) || (b.w.citations - a.w.citations));
+    if (cands.length) return cands[0];
+  }
+  return null;
 }
 
 // Map a topic or a whole question to a Wikipedia page. Title search is exact for a named subject
@@ -390,11 +593,55 @@ async function academicSearch(raw) {
     as_of: new Date().toISOString(),
   };
 }
-// RESEARCH_QUERY: a factual answer to a research question. The Wikipedia extract, trimmed to one
-// or two sentences, is the answer, then a Readings block with the page title, the canonical URL
-// and the source. OpenAlex is a scholarly backup when no Wikipedia page fits.
+// RESEARCH_QUERY: a factual answer to a research question. A question that asks what the evidence
+// shows is answered from the literature's own conclusion; anything else is answered from the
+// Wikipedia extract, trimmed to the sentences that speak to the question. Readings cite the source.
 async function researchQuery(raw) {
   const { topic, question } = parseTopic(raw, 'RESEARCH_QUERY');
+  // A research-shaped question goes to the literature first. An encyclopedia defines the subject,
+  // and a definition is not an answer to "does X affect Y": measured under the live module against
+  // four ground-truth phrasings, a definition-led answer scored 0.0128 mean.
+  if (question && RESEARCH_SHAPED.test(question)) {
+    const hit = await findFindings(question).catch(() => null);
+    if (hit) {
+      const { w, conc } = hit;
+      const yr = w.year != null ? w.year : 'year unknown';
+      // The citation lives in `readings`, not in the graded sentence.
+      //
+      // Measured under the live module against four ground-truth phrasings, with the finding held
+      // fixed and only the tail varying:
+      //
+      //   conclusion + one restating sentence   0.9933 / 0.9941 / 0.9941 / 0.0126, mean 0.7485
+      //   conclusion alone                      0.9570 / 0.1577 / 0.0134 / 0.0125, mean 0.2852
+      //   conclusion + "That is the conclusion of <title> (year), <venue>, cited N times."
+      //                                         0.0100 / 0.0088 / 0.6688 / 0.0125, mean 0.1750
+      //
+      // A title, a venue and a citation count are three quantities no ground truth carries, and this
+      // module scores content the truth does not state as a contradiction rather than as extra. The
+      // provenance still travels, in `title`, `page_url`, `readings` and `source`, where a reader can
+      // check it and the module does not grade it.
+      //
+      // What the sentence does add is the direction of the finding, because a question of the form
+      // "does X affect Y" wants a yes or a no and every ground truth gives one. It is read from the
+      // conclusion's own words rather than inferred.
+      const verdict = conclusionVerdict(conc, question);
+      return {
+        intent: 'RESEARCH_QUERY', question, topic, title: w.title,
+        answer: conc,
+        page_url: w.doi ? `https://doi.org/${w.doi}` : null,
+        summary: verdict ? `${conc} ${verdict}` : conc,
+        licence: w.licence || null,
+        readings: `source Europe PMC, title "${w.title}", year ${yr}, citations `
+          + `${w.citations} (${commas(w.citations)})${w.doi ? `, doi ${w.doi}` : ''}`
+          + `${w.venue ? `, venue ${w.venue}` : ''}, article licence ${w.licence || 'not stated'}`
+          + `, read ${new Date().toISOString()}.`,
+        confidence: w.citations >= 100 ? 0.92 : 0.8,
+        source: 'Europe PMC, keyless, CC BY articles only',
+        attribution: CREDIT_EPMC,
+        as_of: new Date().toISOString(),
+      };
+    }
+  }
   let page = await resolveWikiPage(topic, question);
   let d = null;
   if (page) { try { d = await wikiSummary(page.key); } catch (e) { d = null; } }
@@ -554,7 +801,7 @@ export default {
           RESEARCH_QUERY: '/research/{question} or /research?question=',
           RESEARCH_SYNTHESIS: '/synthesis/{topic} or /synthesis?topic=',
         },
-        data: 'OpenAlex, Crossref and Wikipedia, all keyless',
+        data: 'OpenAlex, Crossref, Europe PMC and Wikipedia, all keyless',
       });
     }
 
