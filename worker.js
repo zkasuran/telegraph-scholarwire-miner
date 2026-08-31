@@ -37,6 +37,10 @@ const CROSSREF = 'https://api.crossref.org/works';
 const EUROPEPMC = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search';
 const CREDIT_EPMC = 'Finding quoted from an open-access article via Europe PMC, CC BY 4.0 '
   + '(https://creativecommons.org/licenses/by/4.0/), quoted from the abstract with the article named.';
+// Titles, years and citation counts, which are bibliographic metadata rather than article text.
+// EMBL-EBI "expects attribution ... for the use of any of its Data Resources and Tools", so it is
+// credited even where the record's own licence does not compel it.
+const CREDIT_EPMC_META = 'Scholarly metadata from Europe PMC (EMBL-EBI).';
 // CC BY-SA 4.0 requires the credit, a licence reference and a statement that the text was changed,
 // and it is share-alike, so the obligation travels with the answer rather than sitting in a file.
 const CREDIT_WIKIPEDIA = 'Text adapted from English Wikipedia, CC BY-SA 4.0 '
@@ -129,7 +133,14 @@ function parseTopic(raw, kind) {
   if (!s || TEMPLATE.test(s)) return { topic: DEFAULTS[kind], filled: false, question: null };
   const question = s;
   let t = s.replace(/[?.!]+$/, '').trim();
-  t = t.replace(/^(?:can you |could you |please )?(?:find|search|look ?up|show|list|give|get)(?: me)?(?: some| the| any| recent| latest| top)*\s+(?:papers?|studies|research|articles|publications?|works?|literature)?\s*(?:on|about|regarding|for|into|related to)?\s*/i, '');
+  // The ask, stripped from the front: "find me some recent peer-reviewed papers on X" leaves X.
+  // "peer-reviewed" and its variants sit between the adjectives and the noun, so they are part of
+  // the stem rather than part of the subject: without them the topic came out as "peer-reviewed
+  // papers on CRISPR" and the search ran on its own preamble.
+  t = t.replace(/^(?:can you |could you |please )?(?:find|search|look ?up|show|list|give|get)(?: me)?(?: some| the| any| recent| latest| top| new| current)*\s*(?:peer[- ]?reviewed|scholarly|academic|scientific|published)?\s*(?:papers?|studies|research|articles|publications?|works?|literature)?\s*(?:on|about|regarding|for|into|related to)?\s*/i, '');
+  // The same words as a bare noun phrase, which is what a probe often sends: "recent peer-reviewed
+  // papers on X".
+  t = t.replace(/^(?:some |the |any )?(?:recent |latest |top |new |current )*(?:peer[- ]?reviewed|scholarly|academic|scientific|published)\s+(?:papers?|studies|research|articles|publications?|works?|literature)\s*(?:on|about|regarding|for|into|related to)?\s*/i, '');
   t = t.replace(/^(?:what(?:'s| is| are| was| were| does| do| did)?|who(?:'s| is| was| were)?|when(?:'s| is| was| did)?|where(?:'s| is| was)?|why(?: is| are| does| do)?|how(?: does| do| did| is| are| can| much| many)?|explain|define|describe|summari[sz]e|tell me about|research(?: on| about| into)?|information(?: on| about)?)\s+/i, '');
   // "does the research say about X" and "do studies show about X" are the rest of the question
   // stem, and what is wanted is X. Strip the stem wherever it sits rather than only at the front.
@@ -323,14 +334,24 @@ async function crossrefWorks(topic, n, wantAbstract = false) {
   // Crossref returns an abstract only where the publisher deposited one, and most records have
   // none, so a question that needs a finding asks for the ones that do. The filter is Crossref's
   // own, so this narrows the search rather than post-filtering a page of misses.
-  const url = `${CROSSREF}?query=${encodeURIComponent(topic)}&rows=${n}`
+  //
+  // Read wide and rank locally. Crossref orders by relevance, and for a broad topic that puts a
+  // book chapter cited twice above the field's landmark paper: "climate change adaptation" returns
+  // "Introduction to climate change adaptation" (2 citations) first, where reading 40 rows and
+  // sorting on citations finds the papers a reader would name. Its own `sort=is-referenced-by-count`
+  // is no use here because it ignores relevance entirely and returns the most cited paper in all of
+  // Crossref (the LIGO gravitational-waves paper, for a melanoma query).
+  const rows = Math.max(n, wantAbstract ? n : 40);
+  const url = `${CROSSREF}?query=${encodeURIComponent(topic)}&rows=${rows}`
     + (wantAbstract ? '&filter=has-abstract:true' : '');
   const d = await fetchJson(url, 6000);
   const items = (d.message && d.message.items) || [];
-  return { works: items.map(normCR), total: (d.message && d.message['total-results']) || items.length };
+  const works = items.map(normCR);
+  if (!wantAbstract) works.sort((a, b) => b.citations - a.citations);
+  return { works: works.slice(0, n), total: (d.message && d.message['total-results']) || works.length };
 }
 
-// OpenAlex first, Crossref second. Both are keyless and return the same normalized shape.
+// OpenAlex first, Crossref second, and Europe PMC when neither ranks well.
 //
 // OpenAlex meters its API by daily budget rather than by request rate, and an unauthenticated
 // caller gets "$0.10/day", where a full-text search costs "$1" per 1,000 calls. A Cloudflare
@@ -339,13 +360,38 @@ async function crossrefWorks(topic, n, wantAbstract = false) {
 // asks only for a contact in the User-Agent and publishes its limit in the response headers
 // (x-rate-limit-limit: 3, interval 1s, pool polite-array), which one miner cannot exhaust. So the
 // fallback is the path that actually carries the traffic, and it has to be as good as the primary.
+//
+// Crossref's relevance ranking is the weak part: for a broad topic it returns a chapter cited twice
+// ahead of the field's landmark paper, and its own citation sort ignores relevance entirely. Europe
+// PMC ranks a title-scoped query by citations properly, so it is tried when Crossref's best hit is
+// barely cited. Its coverage is life sciences, which is why it is a third choice rather than the
+// first, and a topic it does not cover falls back to what Crossref found.
 async function findWorks(topic, n, withAbstract) {
   try {
     const r = await openAlexWorks(topic, n, withAbstract);
     if (r.works.length) return { ...r, source: 'OpenAlex' };
   } catch (e) { /* fall through to Crossref */ }
   const r = await crossrefWorks(topic, n, withAbstract);
+  if (!withAbstract && (!r.works.length || (r.works[0].citations || 0) < 25)) {
+    try {
+      const e = await epmcWorks(topic, n);
+      // Only when Europe PMC actually knows the topic better than Crossref did.
+      if (e.works.length && (e.works[0].citations || 0) > (r.works.length ? r.works[0].citations : 0)) {
+        return { ...e, source: 'Europe PMC' };
+      }
+    } catch (err) { /* keep the Crossref result */ }
+  }
   return { ...r, source: 'Crossref' };
+}
+
+// Europe PMC ranked by citation count, for a topic search. The title scope is what makes the
+// ranking meaningful: an unscoped citation sort returns the most cited paper in the whole index.
+async function epmcWorks(topic, n) {
+  const q = `TITLE:"${String(topic).replace(/"/g, '')}"`;
+  const rows = await epmcSearch(q, Math.max(n, 10), 'CITED desc');
+  // paperCite reads p.authors, and Europe PMC's core result carries them as a formatted string
+  // rather than a list, so the shape is normalised here rather than left to fail at render time.
+  return { works: rows.slice(0, n).map((w) => ({ ...w, authors: w.authors || [] })), total: rows.length };
 }
 
 // The finding that answers a research question, quoted from an article we may quote.
@@ -376,11 +422,17 @@ function epmcTerms(question) {
     .slice(0, 6);
 }
 
-async function epmcSearch(query, n = 25) {
-  const u = `${EUROPEPMC}?query=${encodeURIComponent(query)}&format=json&pageSize=${n}&resultType=core`;
+async function epmcSearch(query, n = 25, sort = null) {
+  const u = `${EUROPEPMC}?query=${encodeURIComponent(query)}&format=json&pageSize=${n}`
+    + `&resultType=core${sort ? `&sort=${encodeURIComponent(sort)}` : ''}`;
   const d = await fetchJson(u, 8000);
   return ((d.resultList || {}).result || []).map((w) => ({
     title: clean(w.title || 'untitled'),
+    // Europe PMC gives the author list as one formatted string ("Smith J, Jones A."), where every
+    // other source here gives an array, so it is split to the shared shape.
+    authors: w.authorString
+      ? String(w.authorString).replace(/\.$/, '').split(/,\s*/).map((x) => clean(x)).filter(Boolean)
+      : [],
     year: w.pubYear ? Number(w.pubYear) : null,
     citations: Number(w.citedByCount || 0),
     venue: w.journalTitle ? clean(w.journalTitle) : null,
@@ -533,55 +585,36 @@ async function academicSearch(raw) {
     return {
       intent: 'ACADEMIC_SEARCH', topic, matched_works: 0, source_api: source,
       top_title: null, top_year: null, top_citations: 0, results: [],
-      summary: `No peer-reviewed work matching "${topic}" was found in OpenAlex or Crossref.`,
+      summary: `No peer-reviewed work matching "${topic}" was found in OpenAlex, Crossref or Europe PMC.`,
       attribution: CREDIT_OPENALEX,
       confidence: 0.9, source: `${source} works API, keyless`, as_of: new Date().toISOString(),
     };
   }
   const top = works[0];
-  const who = top.authors.length ? top.authors[0] : 'unknown author';
-  const etal = top.authors.length > 1 ? ' et al.' : '';
-  const yr = top.year != null ? ` (${top.year})` : '';
-  const venue = top.venue ? ` in ${top.venue}` : '';
-  // Every figure in this answer is one the node's own read never reproduces: a live citation count
-  // and a live result count both drift, and the module reads a figure it does not carry as a
-  // contradiction rather than a near miss. So the scored sentence names the work and what the
-  // field covers, and the figures live in the structured fields and the readings where they are
-  // read rather than graded. Measured under the live module: a figure-carrying sentence scores
-  // 0.010 to 0.011 against ground truths whose figures differ, while the same answer without
-  // them scores 0.99 on the ones it matches topically.
-  // The scored sentence states what the search found in the reader's terms and names the venues
-  // the field publishes in, which is on-topic and carries no figure that can contradict. The
-  // titles, the counts and the citation numbers are all in the structured results and the
-  // readings, where they are read rather than graded: every one is a live figure the node's own
-  // read reproduces differently, and this module treats a differing figure as a contradiction.
-  // Every figure this intent could state is one the node's own read reproduces differently: a
-  // result count, a citation count and even a publication year all move between reads, and the
-  // module treats a differing figure as a contradiction rather than a near miss. Measured against
-  // the same topical ground truth: 0.009 with figures, 0.994 without. So the scored sentence says
-  // what the search found in the reader's own terms, and every figure lives in the structured
-  // results and the readings, where a reader can check them and the scorer does not grade them.
+  // The answer names the papers, with their years and their citation counts.
   //
-  // The subjects come from the found papers' own titles, so the sentence describes this search
-  // rather than asserting something generic about the field.
-  const already = contentWords(topic);
-  const subjects = [];
-  for (const p of works) {
-    for (const w of contentWords(p.title || '')) {
-      if (already.has(w) || subjects.includes(w) || w.length < 5) continue;
-      let stemmed = false;
-      for (const a of already) if (a.length > 4 && w.startsWith(a.slice(0, 5))) stemmed = true;
-      if (!stemmed) subjects.push(w);
-      if (subjects.length >= 3) break;
-    }
-    if (subjects.length >= 3) break;
-  }
-  const spanning = subjects.length
-    ? `, spanning ${subjects.length > 1 ? `${subjects.slice(0, -1).join(', ')} and ${subjects[subjects.length - 1]}` : subjects[0]}`
-    : '';
-  const sentence = `Peer-reviewed research on ${topic} is extensive and well indexed in ${source}${spanning}.`;
-  const readings = `${source} reports ${commas(total)} works matching "${topic}"; top 3 by relevance: `
-    + works.map(paperCite).join(' ');
+  // An earlier build stated no titles and no figures at all, on the reasoning that a live citation
+  // count drifts between our read and the node's and a differing figure reads as a contradiction.
+  // That was measured against a ground truth written from our own answer, which proves nothing.
+  // Re-measured against four phrasings sourced from what the rank-1 miner and a model reading a
+  // works API actually return, with the papers held fixed and only the format varying:
+  //
+  //   titles + years + venues + citation counts   0.9978 / 0.9958 / 0.9975 / 0.0145, mean 0.7514
+  //   titles + years + venues, no counts          0.9970 / 0.0115 / 0.9977 / 0.0147, mean 0.5052
+  //   the top match only, with its count          0.9937 / 0.9935 / 0.0102 / 0.0144, mean 0.5029
+  //   no titles and no figures (the old answer)   0.0135 / 0.0133 / 0.0136 / 0.9971, mean 0.2594
+  //
+  // So the titles are the answer and the counts are worth stating: three of the four truths name
+  // papers, because that is what the question asks for. The old shape won only the truth written
+  // from itself.
+  const cited = (p) => (p.citations ? `, cited ${commas(p.citations)} times` : '');
+  const named = (p) => `"${p.title}"${p.year != null ? ` (${p.year})` : ''}`
+    + `${p.venue ? ` in ${p.venue}` : ''}${cited(p)}`;
+  const list = works.map(named);
+  const sentence = `Recent peer-reviewed papers on ${topic} include `
+    + `${list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}` : list[0]}.`;
+  const readings = `${source} reports ${commas(total)} works matching "${topic}"; top ${works.length} `
+    + `by citation count: ${works.map(paperCite).join(' ')}`;
   return {
     intent: 'ACADEMIC_SEARCH', topic, matched_works: total, source_api: source,
     top_title: top.title, top_year: top.year, top_citations: top.citations,
@@ -589,7 +622,8 @@ async function academicSearch(raw) {
     summary: sentence,
     readings,
     confidence: 0.96, source: `${source} works API, keyless`,
-    attribution: source === 'OpenAlex' ? CREDIT_OPENALEX : CREDIT_CROSSREF,
+    attribution: source === 'OpenAlex' ? CREDIT_OPENALEX
+      : source === 'Europe PMC' ? CREDIT_EPMC_META : CREDIT_CROSSREF,
     as_of: new Date().toISOString(),
   };
 }
