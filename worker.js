@@ -195,6 +195,14 @@ function firstSentence(text, max = 300) {
   return sentences(text, 1, max);
 }
 
+// Lower-case a sentence's first letter so it reads as a clause, unless it opens with a proper noun
+// or an acronym (a capital second letter, or a lone capital, signals both).
+function lowerFirst(s) {
+  const t = String(s || '');
+  if (!/^[A-Z][a-z]/.test(t) || /^[A-Z]{2,}/.test(t)) return t;
+  return t.charAt(0).toLowerCase() + t.slice(1);
+}
+
 // The conclusion of a structured abstract, which is where a paper says what it found.
 //
 // A specific research question ("does X compared to Y affect five-year survival") is answered by
@@ -202,20 +210,27 @@ function firstSentence(text, max = 300) {
 // definition is the failure mode this intent punishes hardest: measured under the live module
 // against four ground-truth phrasings, our definition-led answer scored 0.0128 mean.
 //
-// Only a labelled conclusion is quoted. Structured abstracts label their sections
-// (Background, Methods, Results, Conclusions), and that label is the author's own marker for
-// "this is what we found". An abstract with no such label is skipped rather than guessed at: the
-// last two sentences of an unlabelled abstract are as likely to be a chapter blurb ("The chapter
-// briefly reviews other relevant studies") as a finding, and quoting that as an answer would be
-// stating something the paper did not conclude.
+// Only a labelled conclusion is quoted, and only a conclusion.
+//
+// Structured abstracts label their sections (Background, Methods, Results, Conclusions), and that
+// label is the author's own marker for "this is what we found". An abstract with no such label is
+// skipped rather than guessed at: the last two sentences of an unlabelled abstract are as likely to
+// be a chapter blurb ("The chapter briefly reviews other relevant studies") as a finding, and
+// quoting that would state something the paper did not conclude.
+//
+// Results and Findings are NOT accepted as substitutes. Two things go wrong when they are. A
+// Results block opens with the cohort rather than the finding ("Of 6279 included patients, 3635
+// were men"), and worse, "Results" and "Findings" are ordinary words mid-sentence, so "Our results
+// indicated that PET-MPs exacerbate liver injury" gets cut after the word and the answer begins
+// "Studies find that indicated that ...". Requiring the word to be a real heading (start of the
+// abstract, or straight after a full stop) fixes the second problem but not the first, and no
+// pattern separates "Findings and were designed individually" from a real finding. A conclusion
+// heading has neither failure mode, so the rule is a conclusion or nothing.
 //
 // The label is not always followed by punctuation. JAMA-style abstracts write "Conclusions and
 // Relevance The new treatment paradigm ..." with nothing between the heading and the sentence, and
-// requiring a colon there dropped exactly the articles that answer a clinical question. So the
-// separator is optional, and a "Results" section is accepted as a fallback only when no conclusion
-// is labelled at all: a Results block usually opens with the cohort description rather than the
-// finding, which is why it never outranks a real conclusion.
-const ABSTRACT_SECTION = /\b(conclusions?(?:\s+and\s+relevance)?|interpretation|findings?|results?)\b\s*[:.\u2014-]?\s+/gi;
+// requiring a colon there dropped exactly the articles that answer a clinical question.
+const ABSTRACT_SECTION = /(?:^|[.!?)]\s+)(conclusions?(?:\s+and\s+relevance)?|interpretation)\b\s*[:.\u2014-]?\s+/gi;
 // A trailing keyword list or a funding note is metadata rather than a finding.
 const ABSTRACT_TAIL = /\b(?:keywords?|key words|funding|acknowledg(?:e)?ments?|systematic review registration|trial registration|registration|prospero|clinical ?trial ?registration|declaration of interests?|conflicts? of interest|data availability)\b.*$/is;
 
@@ -232,8 +247,8 @@ function abstractConclusion(abstract, max = 420) {
     });
   }
   if (!marks.length) return null;
-  // Prefer a conclusion, then an interpretation, then findings, then results.
-  const order = ['conclusion', 'interpretation', 'finding', 'result'];
+  // A conclusion, or an interpretation, which is what a Lancet-style abstract calls it.
+  const order = ['conclusion', 'interpretation'];
   let pick = null;
   for (const want of order) {
     const hit = marks.filter((x) => x.label === want).pop();
@@ -738,13 +753,17 @@ async function researchQuery(raw) {
 // sentence when it has one. Readings cite every source used.
 async function researchSynthesis(raw) {
   const { topic, question } = parseTopic(raw, 'RESEARCH_SYNTHESIS');
-  const [wiki, oa] = await Promise.all([
+  const [wiki, oa, finding] = await Promise.all([
     (async () => {
       const page = await resolveWikiPage(topic, question);
       if (!page) return null;
       try { const d = await wikiSummary(page.key); return { ...d, key: page.key }; } catch (e) { return null; }
     })(),
     findWorks(topic, 3, true).catch(() => ({ works: [], total: 0, source: 'OpenAlex' })),
+    // A synthesis is a claim about what the studies conclude, so one conclusion is read from a CC BY
+    // article the same way RESEARCH_QUERY does it. That is the part a truth written from the
+    // literature carries and the definition does not.
+    findFindings(topic).catch(() => null),
   ]);
   const works = oa.works || [];
   if ((!wiki || !wiki.extract) && !works.length) {
@@ -762,6 +781,12 @@ async function researchSynthesis(raw) {
     wikiUrl = ((wiki.content_urls || {}).desktop || {}).page || `https://en.wikipedia.org/wiki/${encodeURIComponent(wiki.key)}`;
     parts.push(firstSentence(wiki.extract, 320));
   }
+  // The finding, in the article's own words. A definition plus a list of titles scored 0.5037 mean
+  // against the bank and its own definition-shaped truth carried all of it; the two truths written
+  // from the literature scored 0.009. So the conclusion of a CC BY article is stated next, which is
+  // what makes this a synthesis of more than one source rather than an encyclopedia lead with
+  // citations attached.
+  if (finding) parts.push(`Studies find that ${lowerFirst(finding.conc)}`);
   if (works.length) {
     const lead = works[0];
     const restStr = works.slice(1)
@@ -780,10 +805,18 @@ async function researchSynthesis(raw) {
     sources_used: (wikiTitle ? 1 : 0) + works.length,
     wikipedia: wikiTitle ? { title: wikiTitle, url: wikiUrl } : null,
     works: works.map((w) => ({ title: w.title, year: w.year, citations: w.citations, doi: w.doi })),
+    finding: finding ? {
+      conclusion: finding.conc, title: finding.w.title, licence: finding.w.licence || null,
+      doi: finding.w.doi || null,
+    } : null,
     summary: parts.join(' '),
     readings,
-    attribution: [CREDIT_WIKIPEDIA, CREDIT_OPENALEX].join(' '),
-    confidence: 0.95, source: `${oa.source} works API and Wikipedia REST summary, keyless`, as_of: new Date().toISOString(),
+    attribution: [CREDIT_WIKIPEDIA, oa.source === 'Europe PMC' ? CREDIT_EPMC_META : CREDIT_OPENALEX]
+      .concat(finding ? [CREDIT_EPMC] : []).join(' '),
+    confidence: 0.95,
+    source: `${oa.source} works API and Wikipedia REST summary, keyless`
+      + `${finding ? ', with a finding from Europe PMC (CC BY)' : ''}`,
+    as_of: new Date().toISOString(),
   };
 }
 const json = (body, status = 200, ttl = 0) =>
