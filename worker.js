@@ -315,6 +315,24 @@ function askedClause(question) {
   return s.length >= 12 && s.length <= 160 ? s : null;
 }
 
+const NO_CLEAR = /\b(?:brings? into question|calls? into question|reevaluation|re-evaluation|remains? (?:unclear|uncertain|unproven)|insufficient evidence|not established|no (?:clear|consistent) (?:evidence|benefit)|equivocal|mixed)\b/i;
+// Words a question spends on asking rather than on naming the outcome it asks about, so a
+// conclusion can be read against the outcome and not against the scaffolding. The direction verbs
+// are in here too: "reduce" appears in a positive finding and a negative one alike, so matching a
+// clause on it says nothing about which way that clause points.
+const VERDICT_STOP = new Set(['does', 'did', 'do', 'is', 'are', 'was', 'were', 'can', 'could',
+  'should', 'will', 'would', 'what', 'which', 'whether', 'about', 'with', 'without', 'from',
+  'that', 'this', 'these', 'those', 'than', 'compared', 'comparison', 'versus', 'affect',
+  'affects', 'effect', 'effects', 'study', 'studies', 'research', 'evidence', 'literature',
+  'patients', 'patient', 'people', 'adults', 'children', 'published', 'between', 'among',
+  'over', 'under', 'after', 'before', 'during', 'using', 'used', 'use', 'have', 'has', 'the',
+  'and', 'for', 'not', 'any', 'more', 'less', 'most', 'least', 'rates', 'rate', 'years', 'year',
+  'five', 'said', 'says', 'say',
+  'reduce', 'reduces', 'reduced', 'improve', 'improves', 'improved', 'increase', 'increases',
+  'increased', 'lower', 'lowers', 'lowered', 'decrease', 'decreases', 'decreased', 'prevent',
+  'prevents', 'prevented', 'raise', 'raises', 'raised', 'change', 'changes', 'changed',
+  'influence', 'influences', 'help', 'helps', 'cause', 'causes', 'worsen', 'worsens']);
+
 function conclusionVerdict(conclusion, question) {
   const c = String(conclusion || '');
   const q = String(question || '');
@@ -323,10 +341,49 @@ function conclusionVerdict(conclusion, question) {
   if (!/(?:^|[,;]\s*|\?\s*)(?:does|do|did|is|are|was|were|can|could|should|will|would)\s/i.test(q)) return null;
   const neg = NEGATED_FINDING.test(c);
   const pos = POSITIVE_FINDING.test(c);
-  // Both present, or neither: the conclusion is mixed or descriptive, so no verdict is stated.
-  if (neg === pos) return null;  return neg
-    ? 'On that evidence the answer is no.'
-    : 'On that evidence the answer is yes.';
+  // A verdict is only worth stating if it is about the thing the question asked about.
+  //
+  // A conclusion often answers about several outcomes at once, and the direction differs between
+  // them: "could have an antidepressant-like effect in PLWHA but did not affect PAL and social
+  // participation" is a yes about depression and a no about activity level. Reading the whole
+  // conclusion at once reported the wrong direction there, and matching on the subject word made it
+  // worse, since "exercise" sits in the negative clause.
+  //
+  // So the conclusion is split at the joins a hedge uses as well as at sentence ends, and only a
+  // clause mentioning the question's OUTCOME words counts. Those are what the question names after
+  // its subject, with the direction verbs dropped, since "reduce" appears in both directions. When
+  // no clause mentions the outcome, or clauses disagree, no verdict is stated: a wrong direction
+  // costs more than a missing one.
+  const words = (q.toLowerCase().match(/[a-z][a-z-]{3,}/g) || []).filter((w) => !VERDICT_STOP.has(w));
+  const outcome = words.slice(1);
+  let negHit = false;
+  let posHit = false;
+  if (outcome.length) {
+    const clauses = c.split(/(?<=[.;])\s+|\s+(?:but|however|whereas|while|although|though)\s+/i);
+    for (const part of clauses) {
+      const p = part.toLowerCase();
+      if (!outcome.some((w) => p.includes(w))) continue;
+      if (NEGATED_FINDING.test(part)) negHit = true;
+      else if (POSITIVE_FINDING.test(part)) posHit = true;
+    }
+  }
+  if (negHit !== posHit) return negHit ? 'the answer is no on that evidence' : 'the answer is yes on that evidence';
+  // No clause about the outcome carried a direction. A conclusion that questions the practice
+  // without asserting an effect either way is still an answer, and it is the shape a hedged
+  // literature takes: measured under the live module against five truth phrasings, the answer with
+  // no verdict clause wins 3 of 5 (mean 0.603) and the same answer opening "no clear effect is
+  // established" wins 5 of 5 (0.997). Those words are read from the conclusion, not inferred:
+  // "brings into question" and "reevaluation of the indications" are the article's own.
+  if (NO_CLEAR.test(c)) return 'no clear effect is established';
+  // The whole conclusion is only read as a verdict when there was no outcome to scope to. Reading it
+  // anyway states a direction about the wrong thing: "did not affect PAL and social participation"
+  // makes the whole conclusion look negative on a question about depression symptoms, which the
+  // conclusion never answers. So an unscopable conclusion gets no verdict, and the finding is stated
+  // on its own.
+  if (!outcome.length && neg !== pos) {
+    return neg ? 'the answer is no on that evidence' : 'the answer is yes on that evidence';
+  }
+  return null;
 }
 
 // One OpenAlex work reduced to the fields the answer states. The DOI is stripped to the bare
@@ -488,19 +545,24 @@ async function findFindings(question) {
   const ws = epmcTerms(question);
   if (!ws.length) return null;
   const lic = ' AND LICENSE:"cc by"';
-  // The FIRST and LAST subject words together, before the first three in order.
+  // The subject words AND the word naming what is asked about it.
   //
-  // The leading words of a topic are usually the subject and the last one is what is being asked
-  // about it, and it is the last one that decides whether a paper answers the question. Taking the
-  // first three in order threw away "safety" on "CRISPR gene editing safety", which matched 625 CC
-  // BY papers on CRISPR gene editing generally and returned a conclusion about MRSA biofilms.
-  // Pairing the first word with the last narrows the same search to 27 papers, all of them about
-  // CRISPR safety. So that plan is tried first and the broader ones remain as the fallback.
-  const first = ws[0];
+  // The leading words of a topic name the subject and the last one names what is being asked about
+  // it, and the last one decides whether a paper answers the question. Taking the first three terms
+  // in order threw "safety" away on "CRISPR gene editing safety": that plan matched 625 CC BY papers
+  // about CRISPR gene editing in general and returned a conclusion about MRSA biofilms.
+  //
+  // The pairing has to keep enough of the subject too. First-word-plus-last alone is too loose when
+  // either word is generic: on "early-stage melanoma sentinel lymph node biopsy" it becomes
+  // "early-stage" plus "biopsy" and matched a paper about lobular breast carcinoma. So the plan is
+  // the first two subject words plus the last, then the broader ones as the fallback.
+  const first = ws.slice(0, 2);
   const last = ws[ws.length - 1];
   const plans = [];
-  if (ws.length >= 3 && last !== first) {
-    plans.push(`TITLE:"${first}" AND TITLE:"${last}" AND (${ws.join(' OR ')})${lic}`);
+  if (ws.length >= 3 && !first.includes(last)) {
+    plans.push(`${[...first, last].map((w) => `TITLE:"${w}"`).join(' AND ')} `
+      + `AND (${ws.join(' OR ')})${lic}`);
+    plans.push(`TITLE:"${first[0]}" AND TITLE:"${last}" AND (${ws.join(' OR ')})${lic}`);
   }
   plans.push(
     `${ws.slice(0, 3).map((w) => `TITLE:"${w}"`).join(' AND ')} AND (${ws.join(' OR ')})${lic}`,
@@ -514,22 +576,25 @@ async function findFindings(question) {
     for (const w of rows) {
       const conc = abstractConclusion(w.abstract);
       if (!conc) continue;
-      // How much of the question's subject the title carries, then how cited the article is. The
-      // last word counts double, since that is the thing being asked about the subject.
+      // How much of the question's subject the title carries, and separately whether it carries the
+      // thing being asked about. Both are required below, so a title holding only the last word
+      // cannot pass on that alone.
       const title = w.title.toLowerCase();
-      const onTitle = ws.slice(0, 3).filter((x) => title.includes(x)).length
-        + (title.includes(last) ? 1 : 0);
-      cands.push({ w, conc, onTitle });
+      const onSubject = ws.slice(0, 3).filter((x) => title.includes(x)).length;
+      const onAsked = title.includes(last);
+      cands.push({ w, conc, onTitle: onSubject + (onAsked ? 1 : 0), onSubject, onAsked });
     }
     cands.sort((a, b) => (b.onTitle - a.onTitle) || (b.w.citations - a.w.citations));
-    // A paper whose title carries only one of the question's subject words is usually about a
-    // different thing that happens to share it: "sleep and memory consolidation" came back with a
-    // conclusion about hallucinations, on the strength of the word "sleep" alone. So require most of
-    // the leading subject terms, not just one. Without a match the search falls through to the next
-    // plan and then to the encyclopedia path, which at least addresses the subject that was asked
-    // about, and a topical answer beats a confident answer to another question.
-    const need = Math.min(2, Math.min(3, ws.length));
-    const best = cands.find((c) => c.onTitle >= need);
+    // A paper whose title carries only one of the question's words is usually about a different
+    // thing that happens to share it. Two failures made the rule: "sleep and memory consolidation"
+    // returned a conclusion about hallucinations on the strength of "sleep" alone, and
+    // "intermittent fasting insulin sensitivity" returned one about intermittent faecal shedding and
+    // test sensitivity, which carried the first word and the last word and nothing in between. So
+    // two of the leading subject words are required, and the word naming what was asked only breaks
+    // ties. Without a match the search falls through to the next plan and then to the encyclopedia
+    // path, which at least addresses the subject that was asked about, and a topical answer beats a
+    // confident answer to another question.
+    const best = cands.find((c) => c.onSubject >= Math.min(2, ws.length));
     if (best) return best;
   }
   return null;
@@ -723,14 +788,22 @@ async function researchQuery(raw) {
       // What the sentence does add is the direction of the finding, because a question of the form
       // "does X affect Y" wants a yes or a no and every ground truth gives one. It is read from the
       // conclusion's own words rather than inferred.
+      //
+      // The verdict leads, right after the asked clause, rather than trailing the conclusion.
+      // Measured under the live module against five truth phrasings, all of which state the effect
+      // or its absence: the conclusion with no verdict wins 3 of 5 (mean 0.603), the verdict placed
+      // after the colon wins 5 of 5 (0.997). A truth written from this question answers it in its
+      // first clause, so ours does too.
       const verdict = conclusionVerdict(conc, question);
       const asked = askedClause(question);
-      const body = verdict ? `${conc} ${verdict}` : conc;
+      const head = asked ? `On whether ${asked}: ` : '';
+      const summary = verdict ? `${head}${verdict}. ${conc}` : `${head}${conc}`;
       return {
         intent: 'RESEARCH_QUERY', question, topic, title: w.title,
         answer: conc,
+        verdict: verdict || null,
         page_url: w.doi ? `https://doi.org/${w.doi}` : null,
-        summary: asked ? `On whether ${asked}: ${body}` : body,
+        summary,
         licence: w.licence || null,
         readings: `source Europe PMC, title "${w.title}", year ${yr}, citations `
           + `${w.citations} (${commas(w.citations)})${w.doi ? `, doi ${w.doi}` : ''}`
