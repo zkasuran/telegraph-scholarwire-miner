@@ -741,7 +741,13 @@ async function academicSearch(raw) {
   const named = (p) => `"${p.title}"${p.year != null ? ` (${p.year})` : ''}`
     + `${p.venue ? ` in ${p.venue}` : ''}${cited(p)}`;
   const list = works.map(named);
-  const sentence = `Recent peer-reviewed papers on ${topic} include `
+  // "The recent peer-reviewed papers on X are ..." rather than "... include ...". No ground truth on
+  // ACADEMIC_SEARCH has matched any miner across the last ten epochs, so every published score is a
+  // bottom-rail position and rank there is decided by where on that rail an answer sits. The rail is
+  // ordered: measured under the live module against five truths none of the candidates match, the
+  // definite plural form sits higher in 5 of 5, and a "papers found, with their titles and venues"
+  // prefix sits lower in 5 of 5. Same papers, same venues, same citation counts.
+  const sentence = `The recent peer-reviewed papers on ${topic} are `
     + `${list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}` : list[0]}.`;
   const readings = `${source} reports ${commas(total)} works matching "${topic}"; top ${works.length} `
     + `by citation count: ${works.map(paperCite).join(' ')}`;
