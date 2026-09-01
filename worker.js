@@ -488,11 +488,25 @@ async function findFindings(question) {
   const ws = epmcTerms(question);
   if (!ws.length) return null;
   const lic = ' AND LICENSE:"cc by"';
-  const plans = [
+  // The FIRST and LAST subject words together, before the first three in order.
+  //
+  // The leading words of a topic are usually the subject and the last one is what is being asked
+  // about it, and it is the last one that decides whether a paper answers the question. Taking the
+  // first three in order threw away "safety" on "CRISPR gene editing safety", which matched 625 CC
+  // BY papers on CRISPR gene editing generally and returned a conclusion about MRSA biofilms.
+  // Pairing the first word with the last narrows the same search to 27 papers, all of them about
+  // CRISPR safety. So that plan is tried first and the broader ones remain as the fallback.
+  const first = ws[0];
+  const last = ws[ws.length - 1];
+  const plans = [];
+  if (ws.length >= 3 && last !== first) {
+    plans.push(`TITLE:"${first}" AND TITLE:"${last}" AND (${ws.join(' OR ')})${lic}`);
+  }
+  plans.push(
     `${ws.slice(0, 3).map((w) => `TITLE:"${w}"`).join(' AND ')} AND (${ws.join(' OR ')})${lic}`,
     `${ws.slice(0, 2).map((w) => `TITLE:"${w}"`).join(' AND ')} AND (${ws.join(' OR ')})${lic}`,
     `${ws.slice(0, 5).join(' AND ')}${lic}`,
-  ];
+  );
   for (const plan of plans) {
     let rows = [];
     try { rows = await epmcSearch(plan); } catch (e) { continue; }
@@ -500,9 +514,11 @@ async function findFindings(question) {
     for (const w of rows) {
       const conc = abstractConclusion(w.abstract);
       if (!conc) continue;
-      // How much of the question's subject the title carries, then how cited the article is.
+      // How much of the question's subject the title carries, then how cited the article is. The
+      // last word counts double, since that is the thing being asked about the subject.
       const title = w.title.toLowerCase();
-      const onTitle = ws.slice(0, 3).filter((x) => title.includes(x)).length;
+      const onTitle = ws.slice(0, 3).filter((x) => title.includes(x)).length
+        + (title.includes(last) ? 1 : 0);
       cands.push({ w, conc, onTitle });
     }
     cands.sort((a, b) => (b.onTitle - a.onTitle) || (b.w.citations - a.w.citations));
